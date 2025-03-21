@@ -137,6 +137,23 @@ class multiomeHelper:
         self.gene_dict = {str(chrom): group.set_index('tss') for chrom, group in gene_df.groupby('chrom')}
         self.logger.info(f"GTF file processed and genes grouped by chromosome.")
 
+        # get chrom length and shift length
+        temp3 = gtf.loc[gtf[2] == 'chromosome', [0, 4, ]].copy()
+        temp3.reset_index(drop=True, inplace=True)
+        temp3.columns = ['chrom', 'length']
+        temp3['chrom'] = temp3['chrom'].astype(str)
+        temp3['length'] = temp3['length'].astype(int)
+        temp3['order'] = temp3['chrom']
+        temp3.loc[temp3['order']=="X",'order'] = '23'
+        temp3.loc[temp3['order'] == "Y",'order'] = '24'
+        temp3.loc[temp3['order']=="MT",'order'] = '25'
+        temp3['order'] = temp3['order'].astype(int)
+        temp3 = temp3.sort_values(by='order', ascending=True)
+        temp4 = np.array(temp3['length']).astype(int)
+        temp3['length_shift'] = [sum(temp4[range(k),]) for k in range(len(temp4))]
+        self.chr_len = temp3
+        self.logger.info(f"Chromosome length obtained from GTF.")
+
     def link_peak_genes(self):
         """
         基于 TSS 位置将染色质可及性峰（来自 ATAC）与基因（来自 GTF 文件）关联。
@@ -154,6 +171,7 @@ class multiomeHelper:
         peak_info.columns = ['chrom', 'start', 'end']
         peak_info['start'] = peak_info['start'].astype(int)
         peak_info['end'] = peak_info['end'].astype(int)
+
 
         # 删除解析失败的行
         atac_peaks = pd.concat([atac_peaks, peak_info], axis=1)
