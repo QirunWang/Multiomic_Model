@@ -19,10 +19,20 @@ import math
 
 
 class EmbeddingLNorm(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, pad_id=None):
+    def __init__(self, vocab_size, embedding_dim, pad_id=None, init_weights=None):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, embedding_dim, padding_idx=pad_id)
         self.norm = nn.LayerNorm(embedding_dim)
+
+        # If custom_weights is provided, initialize the embedding weights
+        if init_weights is not None:
+            if init_weights.shape != (vocab_size, embedding_dim):
+                raise ValueError("custom_weights must have shape (vocab_size, embedding_dim)")
+            with torch.no_grad():
+                self.emb.weight.copy_(init_weights)
+                # If using a padding_idx, you might want to zero its weights:
+                if pad_id is not None:
+                    self.emb.weight[pad_id].fill_(0)
 
     def forward(self, x):
         """
@@ -351,6 +361,28 @@ class Multiomics_plus(nn.Module):
         pass
 
 
+    def forward_beforeLLM(self,module_RNA, module_ATAC):
+        """
+        Args:
+          module1 (dict): contains keys "gID", "gExpr" and optionally "gExpr_mask" of shape [batch, g_len]
+          module2 (dict): contains keys "aPos", "aExpr" and optionally "aPos_mask", "aExpr_mask" of shape [batch, a_len]
+          task (int): task id (1 to 6) indicating which prediction to make.
+
+        Returns:
+          For tasks 1-4, predictions are made on module2 outputs (for aPos or aExpr).
+          For tasks 5-6, predictions are made on module1 outputs (for gExpr).
+          The returned tensor(s) only include predictions for positions that were masked.
+        """
+
+        # Encode each module.
+        RNA_embeddings = self.Embed_RNA(module_RNA)
+        ATAC_embeddings = self.Embed_ATAC(module_ATAC)
+
+        # concate sentence
+        All_embeddings = torch.concat([RNA_embeddings, ATAC_embeddings],dim=1)
+
+        return All_embeddings
+
     def forward(self,module_RNA, module_ATAC):
         """
         Args:
@@ -393,6 +425,7 @@ class Multiomics_plus(nn.Module):
 
 
 
+
 # Example usage:
 if __name__ == '__main__':
     import sys
@@ -429,10 +462,11 @@ if __name__ == '__main__':
                              num_layers = 2,
                              dropout = 0.1)
 
-    # test forward
-    out_RNA, out_ATAC = Mymodel(RNA_module, ATAC_module)
+    # # test forward
+    # out_RNA, out_ATAC = Mymodel(RNA_module, ATAC_module)
 
-
+    # test forward before LLM
+    LMM_input = Mymodel.forward_beforeLLM(RNA_module, ATAC_module)
 
 
 
