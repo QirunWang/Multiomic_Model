@@ -6,12 +6,25 @@ import matplotlib.pyplot as plt
 from anndata import AnnData
 import os
 import logging
+import json
 
+position_dict_path = '/home/share/huadjyin/home/lishaoshuai/xierunda/'
+
+with open(position_dict_path+"gene_global_position_dict.json", "r") as json_file:
+    gene_global_position_dict = json.load(json_file)
+with open(position_dict_path+"chrom_prefix_length.json", "r") as json_file:
+    chrom_prefix_length = json.load(json_file)
 
 class preprocessHelper:
 
-    def __init__(self, adata=None, data_path=None, RNA_scaling_factor=10000, ATAC_scaling_factor=10000):
+    def __init__(self, 
+                 adata=None, data_path=None, 
+                 save_path=None,
+                 gene_global_position_dict = gene_global_position_dict, 
+                 chrom_prefix_length = chrom_prefix_length, 
+                 RNA_scaling_factor=10000, ATAC_scaling_factor=10000):
         """
+        初始化 multiomeHelper 类。
 
         参数：
             adata: 现有的 AnnData 对象（可选）。
@@ -24,6 +37,9 @@ class preprocessHelper:
         self.data_path = data_path
         self.RNA_scaling_factor = RNA_scaling_factor
         self.ATAC_scaling_factor = ATAC_scaling_factor
+        self.gene_global_position_dict = gene_global_position_dict
+        self.chrom_prefix_length = chrom_prefix_length
+        self.save_path = save_path 
         
         if self.data_path:
             dir_name = os.path.dirname(self.data_path)  # 
@@ -190,11 +206,10 @@ class preprocessHelper:
             self.logger.warning(f"{self.file_name}: No RNA-seq data found in feature_types.")
         else:
             # Normalization
-            self.logger.info(f"{self.file_name}: Performing total count normalization on RNA-seq data.")
             sc.pp.normalize_total(gene_adata, target_sum=self.RNA_scaling_factor)
             
             # log1p 
-            self.logger.info(f"{self.file_name}: Applying log1p transformation on RNA-seq data.")
+            self.logger.info(f"{self.file_name}: Applying normalization and log1p transformation on RNA-seq data.")
             sc.pp.log1p(gene_adata)
             self.adata.X[:, gene_expression_bool] = gene_adata.X
 
@@ -240,10 +255,67 @@ class preprocessHelper:
         self.filter_standard_peaks()
         self.filter_by_valid_peaks()
         self.normalize_and_log1p()
-
-        self.logger.info("All preprocessing steps applied.")
+        self.add_gene_global_position()
+        self.add_peak_global_positions()
+        self.remove_nan()
         
 
+        self.logger.info("All preprocessing steps applied.")
+    
+    def add_gene_global_position(self):
+        """
+        Add the global position of genes and peaks to the AnnData object.
+        
+        """
+        #Gene position:
+        
+        gene_expression_bool = self.adata.var["feature_types"] == "Gene Expression"
+        self.adata.var.loc[gene_expression_bool, "position"] = self.adata.var.loc[gene_expression_bool, "gene_ids"].map(self.gene_global_position_dict)
+        self.logger.info(f"{self.file_name}: Added global positions for genes.")
+        
+    def compute_peak_position(self, peak_id):
+        """
+        计算 peak 的全基因组位置。
+        
+        参数：
+        - peak_id: peak 的标识符，形如 'chr1:1000-2000'
+        
+        返回：
+        - 计算的全基因组位置
+        """
+        try:
+            chrom, coords = peak_id.split(':')  
+            start, end = map(int, coords.split('-'))  
+            mid_point = (start + end) // 2 
+            chrom_id = chrom.replace('chr', '')  
+            return self.chrom_prefix_length.get(chrom_id, 0) + mid_point  
+        except Exception as e:
+            print(f"Error processing peak ID {peak_id}: {e}")
+            return np.nan
+
+    
+    def add_peak_global_positions(self):
+        """
+        计算 peaks 的 position 并更新到 adata.var['position']。
+        
+        参数：
+        - peak_bool: 布尔索引，标识 peaks 行。
+        """
+        # 计算 position 列
+        peak_bool = self.adata.var["feature_types"] == "Peaks"
+        self.adata.var.loc[peak_bool, 'position'] = self.adata.var.loc[peak_bool, 'gene_ids'].apply(self.compute_peak_position)
+        self.logger.info(f"{self.file_name}: Added global positions for peaks.")
+                
+
+    def remove_nan(self):
+        """
+        remove gene and peaks with Nan in Position
+        """
+        
+        non_nan_position = self.adata.var['position'].notna()
+
+        self.adata = self.adata[:, non_nan_position]
+        
     def get_adata_size(self):
         """
         Get the shape of the AnnData object.
@@ -257,17 +329,19 @@ class preprocessHelper:
     
     def save_as_filtered(self):
         """
-        Save the filtered data as an .h5ad file in the current working directory.
-        The filename is modified to add '_clean.h5ad'.
+        Save the filtered data as an .h5ad file in the specified save_path.
+        The filename is based on the original file name with '_clean' appended before the extension.
+        If save_path is not provided, the file is saved in the current working directory.
         """
         if self.data_path:
-            base_name = os.path.basename(self.data_path) 
-            base_name = os.path.splitext(base_name)[0]  
-            filtered_filename = f"{base_name}_clean.h5ad"  
+            base_name = os.path.basename(self.data_path)
+            base_name = os.path.splitext(base_name)[0]
+            filtered_filename = f"{base_name}_clean.h5ad"
         else:
-            filtered_filename = "filtered_clean.h5ad"  
-
-        filtered_path = os.path.join(os.getcwd(), filtered_filename)  
+            filtered_filename = "filtered_clean.h5ad"
+        
+        save_dir = self.save_path if self.save_path else os.getcwd()
+        filtered_path = os.path.join(save_dir, filtered_filename)
 
         self.adata.write(filtered_path)
         self.logger.info(f"Filtered data saved to {filtered_path}.")
