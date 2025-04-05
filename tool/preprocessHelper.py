@@ -1,6 +1,7 @@
 import scanpy as sc
 import pandas as pd
 import numpy as np
+import scipy.sparse as sp
 import matplotlib.pyplot as plt
 
 from anndata import AnnData
@@ -221,10 +222,13 @@ class preprocessHelper:
             self.logger.warning(f"{self.file_name}: No ATAC data found in feature_types.")
         else:
             # Normalization
-            self.logger.info(f"{self.file_name}: Performing total count normalization on ATAC data.")
+            self.logger.info(f"{self.file_name}: Performing total count normalization on ATAC data, construct on dense X")
             sc.pp.normalize_total(atac_data, target_sum=self.ATAC_scaling_factor)
 
-            self.adata.X[:, atac_bool] = atac_data.X
+            temp_dense_adata = self.adata.X.toarray()
+            temp_dense_adata[:, atac_bool] = atac_data.X.toarray()
+            
+            self.adata.X = sp.csr_matrix(temp_dense_adata) 
             
         self.logger.info(f"{self.file_name}: Normalization and log1p transformation applied to RNA-seq and ATAC data.")
 
@@ -345,3 +349,59 @@ class preprocessHelper:
 
         self.adata.write(filtered_path)
         self.logger.info(f"Filtered data saved to {filtered_path}.")
+
+
+
+class H5adSplitter:
+    def __init__(self, data_path, save_path, cells_per_split=10000):
+        """
+        初始化 H5adSplitter 类。
+        
+        参数：
+        data_path: str
+            输入数据的路径（.h5ad 文件）。
+        save_path: str
+            拆分文件保存路径。
+        cells_per_split: int
+            每个拆分文件包含的最大细胞数，默认为 10000。
+        """
+        self.data_path = data_path
+        self.save_path = save_path
+        self.cells_per_split = cells_per_split
+        self.adata = None
+
+        # 读取数据
+        self.read_data()
+
+    def read_data(self):
+        """读取输入的 .h5ad 数据文件"""
+        if not os.path.exists(self.data_path):
+            raise FileNotFoundError(f"Input file {self.data_path} not found.")
+        
+        self.adata = sc.read_h5ad(self.data_path)
+        print(f"Loaded data with shape: {self.adata.shape}")
+    
+    def split_and_save(self):
+        """将数据按细胞数量拆分并保存为多个 .h5ad 文件"""
+        num_cells = self.adata.shape[0]
+        num_splits = (num_cells // self.cells_per_split) + (1 if num_cells % self.cells_per_split != 0 else 0)
+
+        # 获取原始文件名用于保存
+        base_name = os.path.basename(self.data_path)
+        base_name_no_ext = os.path.splitext(base_name)[0]
+
+        for i in range(num_splits):
+            # 计算当前拆分文件的细胞范围
+            start_idx = i * self.cells_per_split
+            end_idx = min((i + 1) * self.cells_per_split, num_cells)
+
+            # 拆分数据
+            adata_split = self.adata[start_idx:end_idx, :]
+
+            # 保存拆分的数据
+            split_filename = f"{base_name_no_ext}_{i + 1}.h5ad"
+            split_path = os.path.join(self.save_path, split_filename)
+            adata_split.write(split_path)
+            print(f"Saved split {i + 1} to {split_path}")
+
+        print("Data split and saved successfully.")
