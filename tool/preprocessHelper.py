@@ -319,6 +319,69 @@ class preprocessHelper:
         non_nan_position = self.adata.var['position'].notna()
 
         self.adata = self.adata[:, non_nan_position]
+    
+    def add_stat_inbatch(self):
+        """
+        Add statistical information for every gene within a batch.
+        Only compute statistics for features marked as genes; for peaks, values will be set to NAN.
+        The computed statistics include mean, std, min, q25, median, q75, and max.
+
+        Assumes self.adata.var includes a boolean column 'is_gene' where True indicates a gene.
+        """
+        # Convert sparse matrix to array if necessary.
+        if sp.issparse(self.adata.X):
+            data = self.adata.X.A  # or use .toarray() if preferred
+        else:
+            data = np.asarray(self.adata.X)
+
+        # Number of features (genes + peaks)
+        n_features = data.shape[1]
+
+        # Preinitialize arrays with np.nan for every feature
+        means = np.full(n_features, np.nan)
+        stds = np.full(n_features, np.nan)
+        mins = np.full(n_features, np.nan)
+        maxs = np.full(n_features, np.nan)
+        q25 = np.full(n_features, np.nan)
+        medians = np.full(n_features, np.nan)
+        q75 = np.full(n_features, np.nan)
+
+        # Create mask to select genes. Adjust this based on your annotation.
+        # For example, if you do not have an 'is_gene' column, modify the mask appropriately.
+        gene_mask = self.adata.var["feature_types"] == "Gene Expression"  # Ensure this is a boolean numpy array
+
+        # Only process the columns corresponding to genes.
+        if np.sum(gene_mask) > 0:
+            # Filter the gene columns and replace zeros with np.nan so they are ignored in calculations.
+            gene_data = data[:, gene_mask]
+            gene_data_nonzero = np.where(gene_data == 0, np.nan, gene_data)
+
+            # Compute statistics along the 0-axis (across cells) for genes only.
+            means_gene = np.nanmean(gene_data_nonzero, axis=0)
+            stds_gene = np.nanstd(gene_data_nonzero, axis=0)
+            mins_gene = np.nanmin(gene_data_nonzero, axis=0)
+            maxs_gene = np.nanmax(gene_data_nonzero, axis=0)
+            q25_gene = np.nanpercentile(gene_data_nonzero, 25, axis=0)
+            medians_gene = np.nanmedian(gene_data_nonzero, axis=0)
+            q75_gene = np.nanpercentile(gene_data_nonzero, 75, axis=0)
+
+            # Fill in computed statistics for gene entries in the full-length result arrays.
+            means[gene_mask] = means_gene
+            stds[gene_mask] = stds_gene
+            mins[gene_mask] = mins_gene
+            maxs[gene_mask] = maxs_gene
+            q25[gene_mask] = q25_gene
+            medians[gene_mask] = medians_gene
+            q75[gene_mask] = q75_gene
+
+        # Add statistics to adata.var
+        self.adata.var['batch_mean'] = means
+        self.adata.var['batch_std'] = stds
+        self.adata.var['batch_min'] = mins
+        self.adata.var['batch_q25'] = q25
+        self.adata.var['batch_median'] = medians
+        self.adata.var['batch_q75'] = q75
+        self.adata.var['batch_max'] = maxs
         
     def get_adata_size(self):
         """
