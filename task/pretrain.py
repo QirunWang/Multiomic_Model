@@ -36,9 +36,11 @@ torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 
 from tool.ConfigHandler import ConfigHandler
-from dataset.GetData import GetData_LLM
-from dataset.LoadData import MultiomicLoader
-from model.model3 import Multiomics_plus
+from dataset.GetData import GetData_LLM,GetData_LLM_stat
+from dataset.LoadData import MultiomicLoader,MultiomicLoader_stat
+from model.model3 import Multiomics_plus,Multiomics_plus_LoRA_stat
+
+from tool.zclip_PJS import ZClip
 
 class Pretrain(object):
     def __init__(self,
@@ -60,6 +62,10 @@ class Pretrain(object):
                  DataLoader_config_file='Config_Prob_BatchLoader_20250211.json',       # DataLoader config file in ./config/
                  Model_config_file='Config_SiameseTransformer_20250211.json',            # Model config file in ./config/
 
+                 Dataset_use = 'GetData_LLM',
+                 DataLoader_use = 'MultiomicLoader',
+                 Model_use = 'Multiomics_plus',
+
                  drawableidx_train_path="./references/drawableidx_train_20250403.npy",# the idx of fraction of data reserved for train
                  drawableidx_valid_path="./references/drawableidx_valid_20250403.npy", # the idx of fraction of data reserved for valid
 
@@ -74,7 +80,9 @@ class Pretrain(object):
                  checkpoint_load_path = None,  # if none, start the model from scratch
                  model_param_load = True,
                  optimizer_param_load = True,
-                 scheduler_param_load = True
+                 scheduler_param_load = True,
+
+                 grad_clip = True # use zclip to clip grad to aviod spikes in loss
 
                  ):
 
@@ -99,7 +107,11 @@ class Pretrain(object):
         print(self.Model_config)
 
         # instantiations of Dataset
-        self.Dataset = GetData_LLM(**self.Dataset_config)
+        if Dataset_use == 'GetData_LLM':
+            self.Dataset = GetData_LLM(**self.Dataset_config)
+        elif Dataset_use == 'GetData_LLM_stat':
+            print("[-----pretrain.py]Enabling stat info")
+            self.Dataset = GetData_LLM_stat(**self.Dataset_config)
 
         #get drawable idx
         self.drawableidx_train_path = drawableidx_train_path
@@ -109,7 +121,13 @@ class Pretrain(object):
         print(f'[-----pretrain.py]train data size (drawableidx_train): {len(self.drawableidx_train)})')
 
         # instantiations of model
-        self.model = Multiomics_plus(**self.Model_config)
+        if Model_use == 'Multiomics_plus':
+            self.model = Multiomics_plus(**self.Model_config)
+        elif Model_use == 'Multiomics_plus_LoRA_stat':
+            print("[-----pretrain.py]Enabling lora mode")
+            self.model = Multiomics_plus_LoRA_stat(**self.Model_config)
+            print(f"[-----pretrain.py]Training task: {self.model.task}")
+
 
         #load checkpoint params to the model
         self.checkpoint_load_path = checkpoint_load_path
@@ -120,7 +138,7 @@ class Pretrain(object):
             print(f"[-----pretrain.py]load previous trained weights from {self.checkpoint_load_path}")
             checkpoint = torch.load(self.checkpoint_load_path)
             if self.model_param_load:
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
         # set optimizer's para
         self.lr = lr
@@ -189,7 +207,19 @@ class Pretrain(object):
         #init dataloader
         self.DataLoader_config['dataset'] = self.Dataset
         self.DataLoader_config['drawable_indices'] = self.drawableidx_train
-        self.DataLoader = MultiomicLoader(**self.DataLoader_config)
+        self.DataLoader_config['distributed'] = False if self.parallel is None else True
+        self.DataLoader_use = DataLoader_use
+        if self.DataLoader_use == 'MultiomicLoader':
+            self.DataLoader = MultiomicLoader(**self.DataLoader_config)
+        elif self.DataLoader_use == 'MultiomicLoader_stat':
+            self.DataLoader = MultiomicLoader_stat(**self.DataLoader_config)
+
+        #init grad clip
+        self.grad_clip = grad_clip
+        if self.grad_clip:
+            print("[-----pretrain.py]enable grad clip with zclip")
+            self.zclip = ZClip(mode="zscore", alpha=0.97, z_thresh=2.5, clip_option="adaptive_scaling", max_grad_norm=1.0,
+                          clip_factor=1.0)
 
     def init_DDP(self):
         # init nccl
@@ -215,6 +245,10 @@ class Pretrain(object):
             output_device=self.local_rank,
             find_unused_parameters=True
         )
+
+        #add some info into model
+        self.model.task = self.model.module.task
+        self.model.pad_id = self.model.module.pad_id
 
     def test_dataset(self):
         start = time.time()
@@ -263,6 +297,7 @@ class Pretrain(object):
 
 
     def test_forward(self,ifreturn=True):
+        torch.cuda.empty_cache()
         for RNA_module, ATAC_module in self.DataLoader:
             for key, tensor in RNA_module.items():
                 RNA_module[key] = tensor.to(self.device)
@@ -422,6 +457,74 @@ class Pretrain(object):
             if count > max_step:
                 break
 
+    def validation(self, model_w_path, valid_epoch_num = 1):
+        print(f"[-----pretrain.py]Enabling validation mode")
+        print(f'[-----pretrain.py]validation data size (drawableidx_train): {len(self.drawableidx_valid)})')
+
+        # init train dataloader
+        self.DataLoader_config_valid = self.DataLoader_config.copy()
+        self.DataLoader_config_valid['drawable_indices'] = self.drawableidx_valid
+        if self.DataLoader_use == 'MultiomicLoader':
+            self.DataLoader_valid = MultiomicLoader(**self.DataLoader_config_valid)
+        elif self.DataLoader_use == 'MultiomicLoader_stat':
+            self.DataLoader_valid = MultiomicLoader_stat(**self.DataLoader_config_valid)
+
+        # load model w to be tested
+        print(f"[-----pretrain.py]load previous trained weights from {model_w_path}")
+        checkpoint = torch.load(model_w_path)
+        self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+        self.model.eval()
+        with torch.no_grad():
+            torch.cuda.empty_cache()
+            total_loss = []
+            for epoch in range(valid_epoch_num):
+                count = 1
+                print(f'[-----pretrain.py]Validation {epoch + 1}/{valid_epoch_num}')
+
+                # set the epoach for the dataloader. This ensures that the shuffling is different across epochs
+                self.DataLoader_valid.set_epoch(epoch)
+
+                # # start train
+                for RNA_module, ATAC_module in self.DataLoader_valid:
+                    # Move data to the GPU
+                    # print('move to GPU')
+                    for key, tensor in RNA_module.items():
+                        RNA_module[key] = tensor.to(self.device)
+                    for key, tensor in ATAC_module.items():
+                        ATAC_module[key] = tensor.to(self.device)
+
+                    with autocast(enabled=True):
+                        # Forward pass
+                        # print('forward')
+                        out_RNA, out_ATAC = self.model(RNA_module, ATAC_module)
+
+                        # Compute the infoNCE loss
+                        # print('loss')
+                        if self.model.task == 'random_NTP':
+                            RNApad_mask = (RNA_module['gID'] != self.model.pad_id).unsqueeze(-1)
+                            ATACpad_mask = (ATAC_module['aPos'] != 0).unsqueeze(-1)
+                            temp_mask = torch.concat([RNApad_mask, ATACpad_mask], dim=1)
+                            predict = torch.concat([out_RNA, out_ATAC], dim=1)[temp_mask]
+                            target = torch.concat([RNA_module['gExpr'], ATAC_module['aExpr']], dim=1).unsqueeze(-1)[
+                                temp_mask]
+                            loss = self.loss_func(predict, target)
+                        else:
+                            temp_res = torch.concat([out_RNA, out_ATAC], dim=1)
+                            temp_mask = torch.concat([RNA_module['gExpr_mask'], ATAC_module['aExpr_mask']],
+                                                     dim=1).bool()
+                            predict = temp_res[temp_mask]
+                            target = torch.concat([RNA_module['gExpr'], ATAC_module['aExpr']], dim=1).unsqueeze(-1)[
+                                temp_mask]
+                            loss = self.loss_func(predict, target)
+                    print(f"[-----pretrain.py]Step {count} Loss: {loss.item():.8f}")
+                    total_loss.append(loss.item())  # Sum the loss
+                    count = count + 1
+
+        print(f"[-----pretrain.py]Validation complete, average loss: {np.mean(total_loss)}")
+        return total_loss
+
+
     def train_single_MSELoss(self, RNA_module, ATAC_module, epoch, count, epoch_checkpoint_dir):
         torch.cuda.empty_cache()
         # Move data to the GPU
@@ -434,19 +537,35 @@ class Pretrain(object):
         with autocast(enabled=True):
             # Forward pass
             # print('forward')
-            out_RNA, out_ATAC = self.model(RNA_module, ATAC_module)
+            out_RNA, out_ATAC, order = self.model(RNA_module, ATAC_module)
 
             # Compute the infoNCE loss
             # print('loss')
-            temp_res = torch.concat([out_RNA, out_ATAC], dim=1)
-            temp_mask = torch.concat([RNA_module['gExpr_mask'], ATAC_module['aExpr_mask']], dim=1).bool()
-            predict = temp_res[temp_mask]
-            target = torch.concat([RNA_module['gExpr'], ATAC_module['aExpr']], dim=1).unsqueeze(-1)[temp_mask]
-            loss = self.loss_func(predict, target)
+            if self.model.task == 'random_NTP':
+                RNApad_mask = (RNA_module['gID'] != self.model.pad_id).unsqueeze(-1)
+                ATACpad_mask = (ATAC_module['aPos'] != 0).unsqueeze(-1)
+                if order == 0:
+                    RNApad_mask[:, :1024, :] = False  # do not calculate the loss with first 1024 tokens
+                else:
+                    ATACpad_mask[:, :1024, :] = False  # do not predict the first 1024 tokens
+                temp_mask = torch.concat([RNApad_mask, ATACpad_mask], dim=1)
+                predict = torch.concat([out_RNA, out_ATAC], dim=1)[temp_mask]
+                target = torch.concat([RNA_module['gExpr'], ATAC_module['aExpr']], dim=1).unsqueeze(-1)[temp_mask]
+                loss = self.loss_func(predict, target)
+
+            else:
+                temp_res = torch.concat([out_RNA, out_ATAC], dim=1)
+                temp_mask = torch.concat([RNA_module['gExpr_mask'], ATAC_module['aExpr_mask']], dim=1).bool()
+                predict = temp_res[temp_mask]
+                target = torch.concat([RNA_module['gExpr'], ATAC_module['aExpr']], dim=1).unsqueeze(-1)[temp_mask]
+                loss = self.loss_func(predict, target)
 
         # Backward
         self.optimizer.zero_grad()
         self.scaler.scale(loss).backward()
+        if self.grad_clip:
+            self.scaler.unscale_(self.optimizer)
+            self.zclip.step(self.model)
         self.scaler.step(self.optimizer)
         self.scaler.update()
         if self.optimizer.param_groups[0]['lr'] > 1e-8:
