@@ -8,6 +8,7 @@
 
 import numpy as np
 import torch
+import math,random
 
 class demo_input:
     def __init__(self,
@@ -23,6 +24,7 @@ class demo_input:
                  aExpr_mask_frac = 0.15,  #mask fraction of aExpr
 
                  addPadding=True,  # whether to add padding if the non-zero lenght < max length
+                 pad_id = 2,
                  max_gene_num=1000, # gene ID range
                  max_expr=10,       # RNA and ATAC log1p expr range
                  max_pos=1e6,       # ATAC postion range
@@ -54,6 +56,7 @@ class demo_input:
         self.aExpr_mask_frac = aExpr_mask_frac
 
         self.addPadding = addPadding
+        self.pad_id = pad_id
         self.max_gene_num = max_gene_num
         self.max_expr = max_expr
         self.max_pos = int(max_pos)
@@ -62,11 +65,14 @@ class demo_input:
         self.stat_dim = stat_dim
         self.max_stat = max_stat
 
-    def _pad_or_crop(self, tensor, total_len):
+    def _pad_or_crop(self, tensor, total_len, gID = True):
         """Pad with zeros if tensor length is less than total_len, or crop if longer."""
         current_len = tensor.size(0)
         if current_len < total_len:
-            pad_tensor = torch.zeros(total_len - current_len, dtype=tensor.dtype)
+            if gID:
+                pad_tensor = torch.full((total_len - current_len,),self.pad_id,dtype=tensor.dtype)
+            else:
+                pad_tensor = torch.zeros(total_len - current_len, dtype=tensor.dtype)
             tensor = torch.cat([tensor, pad_tensor], dim=0)
         else:
             tensor = tensor[:total_len]
@@ -79,13 +85,14 @@ class demo_input:
             tensor = tensor[:total_len]
         return tensor
 
-    def add_stat(self):
+    def add_stat(self, ori_tensor):
         batch_gStat = []
-        for _ in range(self.n_batch):
+        nonpad_counts = (ori_tensor != 0).sum(dim=1)
+        for j in range(self.n_batch):
             # gStat: random floats between 0 and max_stat
             temp2 = []
             for i in range(self.stat_dim):
-                temp1 = torch.rand(self.gene_len) * self.max_stat
+                temp1 = torch.rand(nonpad_counts[j]) * self.max_stat
                 if self.addPadding:
                     temp1 = self._pad_or_crop(temp1, self.gene_total_len)
                 else:
@@ -111,64 +118,76 @@ class demo_input:
 
         for _ in range(self.n_batch):
             # Gene-related tensors
+            # detect whether gene_len is random
+            if self.gene_len is None:
+                temp_gene_len = random.randint(math.ceil(self.gene_total_len / 2), math.ceil(self.gene_total_len * 1.2))
+            else:
+                temp_gene_len = self.gene_len
+
             # gID: unique random integers from 0 to max_gene_num-1.
-            if self.gene_len > self.max_gene_num:
+            if temp_gene_len > self.max_gene_num:
                 raise ValueError("gene_len cannot be greater than max_gene_num for unique values.")
-            gID = torch.randperm(self.max_gene_num)[:self.gene_len]
+            gID = torch.randperm(self.max_gene_num)[:temp_gene_len]
             if self.addPadding:
                 gID = self._pad_or_crop(gID, self.gene_total_len)
             else:
                 gID = self._crop(gID, self.gene_total_len)
 
             # gPos: unique random integers between 1 and max_pos (inclusive)
-            if self.gene_len > self.max_pos:
+            if temp_gene_len > self.max_pos:
                 raise ValueError("gene_len cannot be greater than max_pos for unique gene positions.")
-            gPos = torch.randperm(self.max_pos)[:self.gene_len] + 1
+            gPos = torch.randperm(self.max_pos)[:temp_gene_len] + 1
             if self.addPadding:
                 gPos = self._pad_or_crop(gPos, self.gene_total_len)
             else:
                 gPos = self._crop(gPos, self.gene_total_len)
 
             # gExpr: random floats between 0 and max_expr
-            gExpr = torch.rand(self.gene_len) * self.max_expr
+            gExpr = torch.rand(temp_gene_len) * self.max_expr
             if self.addPadding:
                 gExpr = self._pad_or_crop(gExpr, self.gene_total_len)
             else:
                 gExpr = self._crop(gExpr, self.gene_total_len)
 
             # gExpr_mask: binary mask with probability gExpr_mask_frac for 1
-            gExpr_mask = (torch.rand(self.gene_len) < self.gExpr_mask_frac).to(torch.int64)
+            gExpr_mask = (torch.rand(temp_gene_len) < self.gExpr_mask_frac).to(torch.int64)
             if self.addPadding:
                 gExpr_mask = self._pad_or_crop(gExpr_mask, self.gene_total_len)
             else:
                 gExpr_mask = self._crop(gExpr_mask, self.gene_total_len)
 
             # ATAC-related tensors
+            # detect whether atac_len is random
+            if self.atac_len is None:
+                temp_atac_len = random.randint(math.ceil(self.atac_total_len / 2), math.ceil(self.atac_total_len * 1.2))
+            else:
+                temp_atac_len = self.atac_len
+
             # aPos: unique random integers between 1 and max_pos (inclusive)
-            if self.atac_len > self.max_pos:
+            if temp_atac_len > self.max_pos:
                 raise ValueError("atac_len cannot be greater than max_pos for unique atac positions.")
-            aPos = torch.randperm(self.max_pos)[:self.atac_len] + 1
+            aPos = torch.randperm(self.max_pos)[:temp_atac_len] + 1
             if self.addPadding:
                 aPos = self._pad_or_crop(aPos, self.atac_total_len)
             else:
                 aPos = self._crop(aPos, self.atac_total_len)
 
             # aPos_mask: binary mask with probability aPos_mask_frac for 1
-            aPos_mask = (torch.rand(self.atac_len) < self.aPos_mask_frac).to(torch.int64)
+            aPos_mask = (torch.rand(temp_atac_len) < self.aPos_mask_frac).to(torch.int64)
             if self.addPadding:
                 aPos_mask = self._pad_or_crop(aPos_mask, self.atac_total_len)
             else:
                 aPos_mask = self._crop(aPos_mask, self.atac_total_len)
 
             # aExpr: random floats between 0 and max_expr
-            aExpr = torch.rand(self.atac_len) * self.max_expr
+            aExpr = torch.rand(temp_atac_len) * self.max_expr
             if self.addPadding:
                 aExpr = self._pad_or_crop(aExpr, self.atac_total_len)
             else:
                 aExpr = self._crop(aExpr, self.atac_total_len)
 
             # aExpr_mask: binary mask with probability aExpr_mask_frac for 1
-            aExpr_mask = (torch.rand(self.atac_len) < self.aExpr_mask_frac).to(torch.int64)
+            aExpr_mask = (torch.rand(temp_atac_len) < self.aExpr_mask_frac).to(torch.int64)
             if self.addPadding:
                 aExpr_mask = self._pad_or_crop(aExpr_mask, self.atac_total_len)
             else:
@@ -198,7 +217,7 @@ class demo_input:
         batch_aExpr_mask = torch.stack(batch_aExpr_mask)
 
         if self.addStat:
-            batch_gStat = self.add_stat()
+            batch_gStat = self.add_stat(batch_gID)
             RNA_module = {
                 "gID": batch_gID.to(self.device),
                 "gPos": batch_gPos.to(self.device),
@@ -232,17 +251,21 @@ class demo_input:
 if __name__ == "__main__":
     generator = demo_input(
         n_batch=3,
-        gene_len=5,
-        atac_len=10,
+        gene_len=None,
+        atac_len=None,
         gene_total_len=10,
         atac_total_len=15,
         gExpr_mask_frac=0.15,
         aPos_mask_frac=0,
         aExpr_mask_frac=0.15,
-        addPadding=False,
+        addPadding=True,
+        pad_id=2,
         max_gene_num=1000,
         max_expr=10,
         max_pos=1000000,  # Using an integer value
+        addStat=True,  # whether to add statistic infomation
+        stat_dim=7,  # statdim, [btz, seq_len, stat_dim]
+        max_stat=10,  # max stat
         device = None
     )
     RNA_module, ATAC_module = generator.generate_data()
