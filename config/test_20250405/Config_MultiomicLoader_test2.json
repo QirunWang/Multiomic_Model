@@ -1,0 +1,6 @@
+{
+    "batch_size": 2,
+    "num_workers": 0,
+    "shuffle": true,
+    "distributed": false
+}

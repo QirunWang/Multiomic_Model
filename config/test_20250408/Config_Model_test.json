@@ -1,0 +1,18 @@
+{
+    "gene_vocab_size": 19072,
+    "pad_id": 0,
+    "mask_id": 1,
+    "cls_id": 2,
+    "RNAstart_id": 19068,
+    "RNAend_id": 19069,
+    "ATACstart_id": 19070,
+    "ATACend_id": 19071,
+    "gene_vocab_initW_path": "/home/share/huadjyin/home/lishaoshuai/zhaoyinuo/data/qwen_gene_embeddings.pt",
+    "ebdim_total": 896,
+    "pad_value": 0,
+    "mask_value": -1,
+    "dropout": 0.1,
+    "prompt": "The dataset contains paired scRNAseq and scATACseq data for a single cell obtained using 10X Multiome. Each token represents information about either a gene or an ATAC peak. For gene tokens, each embedding encodes the gene ID, its expression level, and its genomic position. For ATAC peak tokens, each embedding encodes the peak\u2019s expression level and its genomic location. Both gene tokens and peak tokens are framed by special tokens at the beginning and end to mark their respective boundaries. These tokens are then concatenated together, with a prompt embedding token prepended to the sequence. The model\u2019s task is to predict the masked values of gene and peak expression. ",
+    "lora_r": 8,
+    "lora_alpha": 16
+}

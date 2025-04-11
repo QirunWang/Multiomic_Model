@@ -1,0 +1,13 @@
+{
+    "pad_id": 2,
+    "pad_Pos_value": 0,
+    "pad_Expr_value": 0,
+    "gene_total_len": 4096,
+    "atac_total_len": 4096,
+    "gExpr_mask_frac": 0.3,
+    "aPos_mask_frac": 0,
+    "aExpr_mask_frac": 0.3,
+    "pos_scaling_factor": 1000000.0,
+    "gene_vocab_path": "./references/gene_vocab_single_Vqiuping.json",
+    "Database_dir": "/home/share/huadjyin/home/linadi/wqr_files/Projs/20250123_MultiomicsData_1M/clean2/"
+}
