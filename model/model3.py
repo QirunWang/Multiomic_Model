@@ -16,6 +16,7 @@ from torch.nn import TransformerEncoder, TransformerEncoderLayer
 import torch.nn.functional as F
 import torch.optim as optim
 import math
+import random
 
 import sklearn
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -312,7 +313,6 @@ class Multiomics_plus(nn.Module):
         self.aExpr_head = MLP(input_dim = self.ebdim_total,adapter_dim = self.ebdim_total, output_dim = 1,dropout_prob=self.dropout)
         self.gExpr_head = MLP(input_dim = self.ebdim_total,adapter_dim = self.ebdim_total, output_dim = 1,dropout_prob=self.dropout)
 
-
     def genomic_sinusoidal_encoding(self, positions, emb_dim):
         """
         Compute sinusoidal positional encodings for genomic positions.
@@ -326,7 +326,7 @@ class Multiomics_plus(nn.Module):
             Tensor: Positional encodings of shape [batch, seq_len, emb_dim].
         """
         # Normalize positions to reduce the scale.
-        normalized_positions = positions.float() / 1e4  # now in a smaller range
+        normalized_positions = positions.float() / 1  # now in a smaller range (already scale with 1e6 in dataset)
         normalized_positions = normalized_positions.unsqueeze(-1)  # [batch, seq_len, 1]
 
         # Create a tensor of dimension indices.
@@ -560,7 +560,6 @@ class Multiomics_plus(nn.Module):
 
 
         return out_RNA,out_ATAC
-
 class Multiomics_plus_LoRA(Multiomics_plus):
     # input
     # RNA module dict:
@@ -673,7 +672,9 @@ class Multiomics_plus_LoRA_stat(Multiomics_plus_LoRA):
                  prompt = "The dataset contains paired scRNAseq and scATACseq data for a single cell obtained using 10X Multiome. Each token represents information about either a gene or an ATAC peak. For gene tokens, each embedding encodes the gene ID, its expression level, and its genomic position. For ATAC peak tokens, each embedding encodes the peak’s expression level and its genomic location. Both gene tokens and peak tokens are framed by special tokens at the beginning and end to mark their respective boundaries. These tokens are then concatenated together, with a prompt embedding token prepended to the sequence. The model’s task is to predict the masked values of gene and peak expression. ",
 
                  lora_r = 8,
-                 lora_alpha = 16
+                 lora_alpha = 16,
+
+                 task='ATAC_generation'
                 ):
         """
         This is used to add statistic info as well
@@ -696,11 +697,136 @@ class Multiomics_plus_LoRA_stat(Multiomics_plus_LoRA):
                  lora_r=lora_r,
                  lora_alpha=lora_alpha
                 )
+
+        self.task = task
+
         # add a new MLP for stat embedding
         self.RNA_Stat_proj = MLP(input_dim=7,
                                  adapter_dim=self.ebdim_total,
                                  output_dim=self.ebdim_total,
                                  dropout_prob=self.dropout)
+
+        if self.task == 'random_NTP':
+            self.gExpr_head = MLP(input_dim=self.ebdim_total*2,
+                                 adapter_dim=self.ebdim_total*2,
+                                 output_dim=1,
+                                 dropout_prob=self.dropout)
+            self.aExpr_head = MLP(input_dim=self.ebdim_total*2,
+                                 adapter_dim=self.ebdim_total*2,
+                                 output_dim=1,
+                                 dropout_prob=self.dropout)
+
+
+    def task_embeddings(self, module_RNA, module_ATAC):
+        if self.task == 'MLM':
+            # Encode each module.
+            RNA_embeddings = self.Embed_RNA(module_RNA)
+            ATAC_embeddings = self.Embed_ATAC(module_ATAC)
+
+            # define order
+            order = 0 # 0: [RNA,ATAC], 1:[ATAC,RNA]
+            if order == 0:
+                tensor_list = [RNA_embeddings, ATAC_embeddings]
+            else:
+                tensor_list = [ATAC_embeddings, RNA_embeddings]
+
+            # concate sentence
+            All_embeddings_noprompt = torch.concat(tensor_list, dim=1)
+
+        elif self.task == 'random_NTP':
+            # this is used to do next token prediction.
+            # 'random' means RNA and ATAC is presented with randomly order, i.e., [RNA][ATAC] or [ATAC][RNA]
+            aPos = module_ATAC['aPos']
+            aExpr_mask = module_ATAC["aExpr_mask"]
+            gID = module_RNA['gID']
+            gExpr_mask = module_RNA["gExpr_mask"]
+
+            # make all ATAC expr unmasked
+            mask = (aPos != 0)
+            aExpr_mask = aExpr_mask.masked_fill(mask, 0)
+            module_ATAC["aExpr_mask"] = aExpr_mask
+
+            # make all RNA expr unmasked
+            mask = (gID != self.pad_id)
+            gExpr_mask = gExpr_mask.masked_fill(mask, 0)
+            module_RNA["gExpr_mask"] = gExpr_mask
+
+            # Encode each module.
+            RNA_embeddings = self.Embed_RNA(module_RNA)
+            ATAC_embeddings = self.Embed_ATAC(module_ATAC)
+
+            # random shuffle
+            order = random.randint(0, 1) # 0: [RNA,ATAC], 1:[ATAC,RNA]
+            if order == 0:
+                tensor_list = [RNA_embeddings, ATAC_embeddings]
+            else:
+                tensor_list = [ATAC_embeddings,RNA_embeddings]
+
+            # concate sentence
+            All_embeddings_noprompt = torch.concat(tensor_list, dim=1)
+
+        elif self.task == 'ATAC_generation':
+            aPos = module_ATAC['aPos']
+            aExpr_mask = module_ATAC["aExpr_mask"]
+            gID = module_RNA['gID']
+            gExpr_mask = module_RNA["gExpr_mask"]
+
+            # make all ATAC expr masked
+            mask = (aPos != 0)
+            aExpr_mask = aExpr_mask.masked_fill(mask, 1)
+            module_ATAC["aExpr_mask"] = aExpr_mask
+
+            # make all RNA expr unmasked
+            mask = (gID != self.pad_id)
+            gExpr_mask = gExpr_mask.masked_fill(mask, 0)
+            module_RNA["gExpr_mask"] = gExpr_mask
+
+            # Encode each module.
+            RNA_embeddings = self.Embed_RNA(module_RNA)
+            ATAC_embeddings = self.Embed_ATAC(module_ATAC)
+
+            # define order
+            order = 0  # 0: [RNA,ATAC], 1:[ATAC,RNA]
+            if order == 0:
+                tensor_list = [RNA_embeddings, ATAC_embeddings]
+            else:
+                tensor_list = [ATAC_embeddings, RNA_embeddings]
+
+            # concate sentence
+            All_embeddings_noprompt = torch.concat(tensor_list, dim=1)
+
+
+        elif self.task == 'RNA_generation':
+            aPos = module_ATAC['aPos']
+            aExpr_mask = module_ATAC["aExpr_mask"]
+            gID = module_RNA['gID']
+            gExpr_mask = module_RNA["gExpr_mask"]
+
+            # make all ATAC expr unmasked
+            mask = (aPos != 0)
+            aExpr_mask = aExpr_mask.masked_fill(mask, 0)
+            module_ATAC["aExpr_mask"] = aExpr_mask
+
+            # make all RNA expr masked
+            mask = (gID != self.pad_id)
+            gExpr_mask = gExpr_mask.masked_fill(mask, 1)
+            module_RNA["gExpr_mask"] = gExpr_mask
+
+            # Encode each module.
+            RNA_embeddings = self.Embed_RNA(module_RNA)
+            ATAC_embeddings = self.Embed_ATAC(module_ATAC)
+
+            # define order !!!ATAC first!!!
+            order = 1  # 0: [RNA,ATAC], 1:[ATAC,RNA]
+            if order == 0:
+                tensor_list = [RNA_embeddings, ATAC_embeddings]
+            else:
+                tensor_list = [ATAC_embeddings, RNA_embeddings]
+
+            # concate sentence
+            All_embeddings_noprompt = torch.concat(tensor_list, dim=1)
+
+        return All_embeddings_noprompt, order
 
     def Embed_RNA(self, module_RNA):
         """
@@ -761,6 +887,152 @@ class Multiomics_plus_LoRA_stat(Multiomics_plus_LoRA):
 
         return RNA_embeddings
 
+    def Embed_RNA_noExpr(self, module_RNA):
+        """
+        Encodes RNA features.
+        Expects RNA to be a dict with keys:
+            # gID: [g1, ..., gn, pad, ..., pad] [btz,g_len]
+            # gPos: [p1, ..., pn, 0, ..., 0] [btz,g_len]
+            # gExpr: [x1, ..., xn, 0, ..., 0] [btz,g_len]
+            # gExpr_mask: [0, ..., 1, 0, ..., 0] [btz,g_len]
+        Returns:
+          Tensor of shape [batch, g_len, emb_dim].
+        """
+        gID = module_RNA["gID"]
+        gPos = module_RNA["gPos"]
+        gExpr = module_RNA["gExpr"]
+        gExpr_mask = module_RNA["gExpr_mask"]
+        gStat = module_RNA["gStat"]
+
+        # Embed gID
+        gID_embeddings = self.ID_emb(gID)
+
+        # Embed gPos with positional encoding
+        gPos_embeddings = self.genomic_sinusoidal_encoding(gPos, self.ebdim_total)
+        # make the pad embeddings to value 0
+        mask = (gID == self.pad_id).unsqueeze(-1)  # Expand to shape [btz, seq_len, 1]
+        gPos_embeddings = gPos_embeddings.masked_fill(mask,self.padvalue)  # make all values of the dims of padding token to 0
+
+        # Embed gStat
+        # make the mask postion to value -1
+        mask = (gExpr_mask == 1).unsqueeze(-1)
+        gStat = gStat.masked_fill(mask, self.maskvalue)
+        # project it to embeddings
+        gStat_embeddings = self.RNA_Stat_proj(gStat)
+        # make the pad embeddings to value 0
+        pad_mask = (gID == self.pad_id).unsqueeze(-1)
+        gStat_embeddings = gStat_embeddings.masked_fill(pad_mask, self.padvalue)
+
+        # Sum up all embeddings
+        RNA_embeddings = gID_embeddings + gPos_embeddings + gStat_embeddings
+
+        return RNA_embeddings
+
+    def Embed_ATAC_noExpr(self, module_ATAC):
+        """
+        Encodes ATAC features.
+        Expects ATAC to be a dict with keys:
+            # aPos: [p1, ..., pn, 0, ..., 0] [btz,a_len]
+            # aPos_mask: [0, ..., 1, 0, ..., 0] [btz,a_len]
+            # aExpr: [x1, ..., xn, 0, ..., 0] [btz,a_len]
+            # aExpr_mask: [0, ..., 1, 0, ..., 0] [btz,a_len]
+        Returns:
+          Tensor of shape [batch, a_len, emb_dim].
+        """
+        aPos = module_ATAC["aPos"]
+        aPos_mask = module_ATAC["aPos_mask"]
+        aExpr = module_ATAC["aExpr"]
+        aExpr_mask = module_ATAC["aExpr_mask"]
+
+        # Embed aPos with positional encoding
+        # make the mask postion to value -1
+        mask = (aPos_mask == 1)
+        aPos = aPos.masked_fill(mask, self.maskvalue)  # make all values of the dims of mask position to 0
+        # make positional encoding
+        aPos_embeddings = self.genomic_sinusoidal_encoding(aPos, self.ebdim_total)
+        # make the pad embeddings to value 0
+        mask = (aPos == 0).unsqueeze(-1)  # Expand to shape [btz, seq_len, 1]
+        aPos_embeddings = aPos_embeddings.masked_fill(mask,self.padvalue)  # make all values of the dims of padding token to 0
+
+        # Sum up all embeddings
+        ATAC_embeddings = aPos_embeddings
+
+        return ATAC_embeddings
+
+    def forward(self,module_RNA, module_ATAC):
+        """
+        Args:
+          module1 (dict): contains keys "gID", "gExpr" and optionally "gExpr_mask" of shape [batch, g_len]
+          module2 (dict): contains keys "aPos", "aExpr" and optionally "aPos_mask", "aExpr_mask" of shape [batch, a_len]
+          task (int): task id (1 to 6) indicating which prediction to make.
+
+        Returns:
+          For tasks 1-4, predictions are made on module2 outputs (for aPos or aExpr).
+          For tasks 5-6, predictions are made on module1 outputs (for gExpr).
+          The returned tensor(s) only include predictions for positions that were masked.
+        """
+
+        # task specific embeddings
+        All_embeddings_noprompt, order = self.task_embeddings(module_RNA,module_ATAC)
+
+        # Encode prompt
+        prompt_embeddings = self.prompt_embeddings.expand(All_embeddings_noprompt.shape[0], -1, -1)
+        prompt_embeddings = prompt_embeddings.to(self.device)
+
+        # concate sentence
+        All_embeddings = torch.concat([prompt_embeddings, All_embeddings_noprompt], dim=1)
+
+        # get attention mask to filter out padding during calculation
+        gmask_attention = (module_RNA['gID'] != self.pad_id).long().to(self.device)
+        amask_attention = (module_ATAC['aPos'] != 0).long().to(self.device)
+        promptmask_attention = torch.ones((prompt_embeddings.shape[0],prompt_embeddings.shape[1]),dtype=torch.long).to(self.device)
+        mask_attention = torch.concat(tensors =[promptmask_attention,
+                                               torch.ones((prompt_embeddings.shape[0],1),dtype=torch.long, device=self.device),
+                                               gmask_attention,
+                                               torch.ones((prompt_embeddings.shape[0], 1), dtype=torch.long, device=self.device),
+                                               torch.ones((prompt_embeddings.shape[0], 1), dtype=torch.long, device=self.device),
+                                               amask_attention,
+                                               torch.ones((prompt_embeddings.shape[0],1),dtype=torch.long, device=self.device)], dim=1)
+
+        # Pass through LLM
+        All_embeddings = self.LLM(All_embeddings,mask_attention).hidden_states[-1]
+
+        if self.task == 'random_NTP':
+            # devide the RNA and ATAC part
+            if order == 0:
+                temp1 = [self.prompt_embeddings.shape[1], module_RNA['gExpr'].shape[1]+1, 1,module_ATAC['aExpr'].shape[1]+1, 1]
+                _, s_RNA_embeddings, _, s_ATAC_embeddings, _ = torch.split(All_embeddings, temp1, dim=1)
+            else:
+                temp1 = [self.prompt_embeddings.shape[1], module_ATAC['aExpr'].shape[1]+1, 1,module_RNA['gExpr'].shape[1]+1, 1]
+                _, s_ATAC_embeddings, _, s_RNA_embeddings, _ = torch.split(All_embeddings, temp1, dim=1)
+
+            # make the embeddings shift
+            RNA_embeddings = s_RNA_embeddings[:, :-1, :] # delete the last token
+            ATAC_embeddings = s_ATAC_embeddings[:, :-1, :]  # delete the last token
+
+            # embedding the tokens without expression to incorporate other information
+            RNA_embeddings_noExpr = self.Embed_RNA_noExpr(module_RNA)
+            ATAC_embeddings_noExpr = self.Embed_ATAC_noExpr(module_ATAC)
+
+            # concatenate
+            RNA_embeddings = torch.concat([RNA_embeddings,RNA_embeddings_noExpr], dim = 2)
+            ATAC_embeddings = torch.concat([ATAC_embeddings, ATAC_embeddings_noExpr], dim = 2)
+
+        else:
+            # devide the RNA and ATAC part
+            if order == 0:
+                temp1 = [self.prompt_embeddings.shape[1], 1, module_RNA['gExpr'].shape[1], 1, 1, module_ATAC['aExpr'].shape[1],1]
+                _, _, RNA_embeddings, _, _, ATAC_embeddings, _ = torch.split(All_embeddings, temp1, dim=1)
+            else:
+                temp1 = [self.prompt_embeddings.shape[1], 1, module_ATAC['aExpr'].shape[1], 1, 1, module_RNA['gExpr'].shape[1], 1]
+                _, _, ATAC_embeddings, _, _, RNA_embeddings, _ = torch.split(All_embeddings, temp1, dim=1)
+
+        # predict with decoder
+        out_RNA = self.gExpr_head(RNA_embeddings)
+        out_ATAC = self.aExpr_head(ATAC_embeddings)
+
+        return out_RNA,out_ATAC,order
+
 
 # Example usage:
 if __name__ == '__main__':
@@ -768,18 +1040,19 @@ if __name__ == '__main__':
     sys.path.append('./')
     from tool.demo_generator import demo_input
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 
     # generate demo minibatch
     generator = demo_input( n_batch=4,
-                            gene_len=5,
-                            atac_len=10,
+                            gene_len=None,
+                            atac_len=None,
                             gene_total_len=10,
                             atac_total_len=15,
                             gExpr_mask_frac=0.15,
                             aPos_mask_frac=0,
                             aExpr_mask_frac=0.15,
                             addPadding=True,
+                            pad_id=0,
                             max_gene_num=1000,
                             max_expr=10,
                             max_pos=1000000,
@@ -856,7 +1129,8 @@ if __name__ == '__main__':
                                            dropout=0.1,
                                            prompt="The dataset contains paired scRNAseq and scATACseq data for a single cell obtained using 10X Multiome. Each token represents information about either a gene or an ATAC peak. For gene tokens, each embedding encodes the gene ID, its expression level, and its genomic position. For ATAC peak tokens, each embedding encodes the peak’s expression level and its genomic location. Both gene tokens and peak tokens are framed by special tokens at the beginning and end to mark their respective boundaries. These tokens are then concatenated together, with a prompt embedding token prepended to the sequence. The model’s task is to predict the masked values of gene and peak expression. ",
                                            lora_r=8,
-                                           lora_alpha=16
+                                           lora_alpha=16,
+                                           task = 'random_NTP'
                                            )
 
 
@@ -872,7 +1146,7 @@ if __name__ == '__main__':
         print(f"{name}: {'Trainable' if param.requires_grad else 'Frozen'}")
 
     # test forward
-    out_RNA, out_ATAC = Mymodel(RNA_module, ATAC_module)
+    out_RNA, out_ATAC, order = Mymodel(RNA_module, ATAC_module)
 
     # # test forward before LLM
     # LMM_input = Mymodel.forward_beforeLLM(RNA_module, ATAC_module)
@@ -883,10 +1157,23 @@ if __name__ == '__main__':
     # test loss
     MSE_loss = nn.MSELoss()
 
-    temp_res = torch.concat([out_RNA,out_ATAC],dim=1)
-    temp_mask = torch.concat([RNA_module['gExpr_mask'],ATAC_module['aExpr_mask']],dim=1).bool()
-    predict = temp_res[temp_mask]
-    target = torch.concat([RNA_module['gExpr'],ATAC_module['aExpr']],dim=1).unsqueeze(-1)[temp_mask]
+    if Mymodel.task == 'random_NTP':
+        RNApad_mask = (RNA_module['gID'] != Mymodel.pad_id).unsqueeze(-1)
+        ATACpad_mask = (ATAC_module['aPos'] != 0).unsqueeze(-1)
+        if order == 0:
+            RNApad_mask[:,:3, :] = False # do not calculate the loss with first 1024 tokens
+        else:
+            ATACpad_mask[:, :3, :] = False  # do not predict the first 1024 tokens
+        temp_mask = torch.concat([RNApad_mask, ATACpad_mask], dim=1)
+        predict = torch.concat([out_RNA, out_ATAC], dim=1)[temp_mask]
+        target = torch.concat([RNA_module['gExpr'], ATAC_module['aExpr']], dim=1).unsqueeze(-1)[temp_mask]
+        loss = MSE_loss(predict, target)
+    else:
+        temp_res = torch.concat([out_RNA, out_ATAC], dim=1)
+        temp_mask = torch.concat([RNA_module['gExpr_mask'], ATAC_module['aExpr_mask']], dim=1).bool()
+        predict = temp_res[temp_mask]
+        target = torch.concat([RNA_module['gExpr'], ATAC_module['aExpr']], dim=1).unsqueeze(-1)[temp_mask]
+        loss = MSE_loss(predict, target)
 
     temp_loss = MSE_loss(predict, target)
 
