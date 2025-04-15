@@ -23,15 +23,6 @@ class DistributedIndicesSampler(DistributedSampler):
         super().__init__(dataset=dataset,shuffle=shuffle)
         self.drawable_indices = drawable_indices
 
-        if self.shuffle:
-            # deterministically shuffle based on epoch and seed
-            g = torch.Generator()
-            g.manual_seed(self.seed + self.epoch)
-            random_order = torch.randperm(len(self.drawable_indices), generator=g).tolist() # type: ignore[arg-type]
-            self.drawable_indices = [self.drawable_indices[x] for x in random_order]
-        else:
-            self.drawable_indices = self.drawable_indices  # type: ignore[arg-type]
-
         if not self.drop_last:
             # add extra samples to make it evenly divisible
             padding_size = self.total_size - len(self.drawable_indices)
@@ -51,11 +42,44 @@ class DistributedIndicesSampler(DistributedSampler):
 
         return iter(indices)
 
+    def set_epoch(self, epoch: int) -> None:
+        r"""
+        Set the epoch for this sampler and shuffle the drawable index
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
+        if self.shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            random_order = torch.randperm(len(self.drawable_indices), generator=g).tolist()  # type: ignore[arg-type]
+            self.drawable_indices = [self.drawable_indices[x] for x in random_order]
 
 
+class IndicesSampler(Sampler):
+    def __init__(self, dataset, drawable_indices, shuffle=True):
+        """
+        Args:
+            dataset: The dataset (this argument is kept for compatibility with DataLoader).
+            drawable_indices (list): A list of indices specifying which samples to draw.
+            shuffle (bool): Whether to shuffle the indices at the start of each iteration.
+        """
+        self.dataset = dataset
+        # Create a local copy of the drawable indices
+        self.drawable_indices = list(drawable_indices)
+        self.shuffle = shuffle
 
+    def __iter__(self):
+        # Optionally shuffle the indices for each new epoch.
+        indices = self.drawable_indices.copy()
+        if self.shuffle:
+            random.shuffle(indices)
+        return iter(indices)
 
-
+    def __len__(self):
+        # Total number of indices available for sampling.
+        return len(self.drawable_indices)
 
 class MultiomicLoader(DataLoader):
     def __init__(self,
@@ -72,7 +96,7 @@ class MultiomicLoader(DataLoader):
             self.sampler = DistributedIndicesSampler(dataset, self.drawable_indices, shuffle=shuffle)
             shuffle = False  # Disable default shuffling; sampler handles it.
         else:
-            self.sampler = None
+            self.sampler = IndicesSampler(dataset, self.drawable_indices, shuffle=shuffle)
 
         super().__init__(
             dataset=dataset,
@@ -93,6 +117,7 @@ class MultiomicLoader(DataLoader):
         if self.distributed and self.sampler is not None:
             self.sampler.set_epoch(epoch)
 
+
     def collate_fn(self, batch):
         # Unzip the list of tuples into two lists:
         try:
@@ -103,14 +128,14 @@ class MultiomicLoader(DataLoader):
         # For RNA, stack each field using numpy.array to speed up tensor creation.
         RNA_module = {
             "gID": torch.from_numpy(np.array([sample["gID"] for sample in RNA_samples])).int(),
-            "gPos": torch.from_numpy(np.array([sample["gPos"] for sample in RNA_samples])).int(),
+            "gPos": torch.from_numpy(np.array([sample["gPos"] for sample in RNA_samples])).float(),
             "gExpr": torch.from_numpy(np.array([sample["gExpr"] for sample in RNA_samples])).float(),
             "gExpr_mask": torch.from_numpy(np.array([sample["gExpr_mask"] for sample in RNA_samples])).int()
         }
 
         # For ATAC, stack each field similarly.
         ATAC_module = {
-            "aPos": torch.from_numpy(np.array([sample["aPos"] for sample in ATAC_samples])).int(),
+            "aPos": torch.from_numpy(np.array([sample["aPos"] for sample in ATAC_samples])).float(),
             "aPos_mask": torch.from_numpy(np.array([sample["aPos_mask"] for sample in ATAC_samples])).int(),
             "aExpr": torch.from_numpy(np.array([sample["aExpr"] for sample in ATAC_samples])).float(),
             "aExpr_mask": torch.from_numpy(np.array([sample["aExpr_mask"] for sample in ATAC_samples])).int()
@@ -147,7 +172,7 @@ class MultiomicLoader_stat(MultiomicLoader):
         # For RNA, stack each field using numpy.array to speed up tensor creation.
         RNA_module = {
             "gID": torch.from_numpy(np.array([sample["gID"] for sample in RNA_samples])).int(),
-            "gPos": torch.from_numpy(np.array([sample["gPos"] for sample in RNA_samples])).int(),
+            "gPos": torch.from_numpy(np.array([sample["gPos"] for sample in RNA_samples])).float(),
             "gExpr": torch.from_numpy(np.array([sample["gExpr"] for sample in RNA_samples])).float(),
             "gExpr_mask": torch.from_numpy(np.array([sample["gExpr_mask"] for sample in RNA_samples])).int(),
             "gStat": torch.from_numpy(np.array([sample["gStat"] for sample in RNA_samples])).float(),
@@ -155,7 +180,7 @@ class MultiomicLoader_stat(MultiomicLoader):
 
         # For ATAC, stack each field similarly.
         ATAC_module = {
-            "aPos": torch.from_numpy(np.array([sample["aPos"] for sample in ATAC_samples])).int(),
+            "aPos": torch.from_numpy(np.array([sample["aPos"] for sample in ATAC_samples])).float(),
             "aPos_mask": torch.from_numpy(np.array([sample["aPos_mask"] for sample in ATAC_samples])).int(),
             "aExpr": torch.from_numpy(np.array([sample["aExpr"] for sample in ATAC_samples])).float(),
             "aExpr_mask": torch.from_numpy(np.array([sample["aExpr_mask"] for sample in ATAC_samples])).int()
@@ -197,6 +222,7 @@ if __name__ == "__main__":
                                  gExpr_mask_frac=0.15,  # mask fraction of gExpr
                                  aPos_mask_frac=0,  # mask fraction of aPos
                                  aExpr_mask_frac=0.15,  # mask fraction of aExpr
+                                 pos_scaling_factor=1e6,
                                  gene_vocab_path="./references/gene_vocab_single_Vqiuping.json",
                                  Database_dir="/home/share/huadjyin/home/linadi/wqr_files/Projs/20250123_MultiomicsData_1M/clean2/")
     drawable_indices = list(np.load("./references/drawableidx_train_20250403.npy"))

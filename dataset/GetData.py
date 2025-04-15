@@ -415,7 +415,8 @@ class GetData_LLM_stat(GetData_LLM):
                  aPos_mask_frac=0,  # mask fraction of aPos
                  aExpr_mask_frac=0.15,  # mask fraction of aExpr
 
-                 gstat=False, # whether to get statistic infomation into samples
+                 pos_scaling_factor=1e6, # to avoid overflow in float32, make the postion [0-3e9] / 1e6.
+                                         # in this way, the minimal spacing resolution is 0.00024414062, which is about 244 bp on the genome
 
                  gene_vocab_path="./references/gene_vocab_single_Vqiuping.json",
 
@@ -432,7 +433,8 @@ class GetData_LLM_stat(GetData_LLM):
                          gene_vocab_path=gene_vocab_path,
                          Database_dir=Database_dir
                         )
-        self.gstat = gstat
+
+        self.pos_scaling_factor = pos_scaling_factor
 
     def __getitem__(self, total_idx):
         # get the h5ad and the local idx of the total_idx
@@ -460,6 +462,9 @@ class GetData_LLM_stat(GetData_LLM):
         gPos = gPos[random_indices]
         gExpr = gExpr[random_indices]
         gStat = gStat[random_indices,:]
+
+        # scale the Pos
+        gPos = gPos/self.pos_scaling_factor
 
         # set mask to gExpr
         gExpr_mask = (np.random.rand(len(gExpr)) < self.gExpr_mask_frac).astype(int)
@@ -508,6 +513,9 @@ class GetData_LLM_stat(GetData_LLM):
         random_indices = np.random.permutation(len(aPos))
         aPos = aPos[random_indices]
         aExpr = aExpr[random_indices]
+
+        # scale the Pos
+        aPos = aPos / self.pos_scaling_factor
 
         # set mask to aPos
         aPos_mask = (np.random.rand(len(aPos)) < self.aPos_mask_frac).astype(int)
@@ -687,6 +695,7 @@ if __name__ == '__main__':
                                  gExpr_mask_frac=0.15,  # mask fraction of gExpr
                                  aPos_mask_frac=0,  # mask fraction of aPos
                                  aExpr_mask_frac=0.15,  # mask fraction of aExpr
+                                 pos_scaling_factor=1e6,
                                  gene_vocab_path="./references/gene_vocab_single_Vqiuping.json",
                                  Database_dir="/home/share/huadjyin/home/linadi/wqr_files/Projs/20250123_MultiomicsData_1M/clean2/")
 
@@ -754,9 +763,9 @@ if __name__ == '__main__':
     for i in temp0:
         path, id = MyDataset.map_totalIDX_to_localIDX(i)
         RNA_data, ATAC_data = MyDataset.Get_h5ad_info(MyDataset.all_h5ad_path[path], id)
-        print(f"{i}, RNA pos:{RNA_data['gene_positions'].dtype}, ATAC pos: {ATAC_data['peak_positions'].dtype}")
+        print(f"{i}, RNA pos:{(RNA_data['gene_positions']>2147483648).any()}, ATAC pos: {(ATAC_data['peak_positions']>2147483648).any()}")
 
     temp0 = [x - 1 for x in MyDataset.h5ad_cellnum_accumulate]
     for i in temp0:
         RNA_data, ATAC_data = MyDataset[i]
-        print(f"{i}, RNA pos:{RNA_data['gPos'].dtype}, ATAC pos: {ATAC_data['aPos'].dtype}")
+        print(f"{i}, RNA pos:{(RNA_data['gPos']>2147483648).any()}, ATAC pos: {(ATAC_data['aPos']>2147483648).any()}")
